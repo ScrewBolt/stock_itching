@@ -1,11 +1,14 @@
 """Telegram Bot 處理器模組"""
+import asyncio
 import logging
 from typing import Optional
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import TimedOut, NetworkError
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -38,6 +41,34 @@ class TelegramBotHandler:
         self.stock_fetcher = stock_fetcher
         self.logger = logging.getLogger(__name__)
         self.application: Optional[Application] = None
+
+    async def safe_reply(self, update: Update, text: str, max_retries: int = 3, **kwargs):
+        """
+        安全地發送訊息，帶重試機制
+
+        Args:
+            update: Telegram Update 對象
+            text: 訊息內容
+            max_retries: 最大重試次數
+            **kwargs: 其他 reply_text 參數
+        """
+        for attempt in range(max_retries):
+            try:
+                await update.message.reply_text(text, **kwargs)
+                return True
+            except (TimedOut, NetworkError) as e:
+                if attempt < max_retries - 1:
+                    self.logger.warning(
+                        f"發送訊息超時 (嘗試 {attempt + 1}/{max_retries})，重試中..."
+                    )
+                    await asyncio.sleep(1)
+                else:
+                    self.logger.error(f"發送訊息失敗，已重試 {max_retries} 次: {e}")
+                    raise
+            except Exception as e:
+                self.logger.error(f"發送訊息時發生非預期錯誤: {e}", exc_info=True)
+                raise
+        return False
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """處理 /start 命令"""
@@ -107,73 +138,99 @@ class TelegramBotHandler:
 
     async def price_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """處理 /price 命令"""
-        if not context.args or len(context.args) != 1:
-            await update.message.reply_text(
-                "❌ 用法錯誤！\n正確格式：/price <股票代碼>\n範例：/price 2330.TW"
-            )
-            return
+        try:
+            if not context.args or len(context.args) != 1:
+                await update.message.reply_text(
+                    "❌ 用法錯誤！\n正確格式：/price <股票代碼>\n範例：/price 2330.TW"
+                )
+                return
 
-        symbol = context.args[0]
-        await update.message.reply_text(f"🔍 查詢中：{symbol}...")
+            symbol = context.args[0]
+            user_id = update.effective_user.id
+            self.logger.info(f"用戶 {user_id} 請求查詢: {symbol}")
 
-        # 查詢價格
-        result = self.stock_fetcher.get_price(symbol)
+            await update.message.reply_text(f"🔍 查詢中：{symbol}...")
 
-        if result["success"]:
-            price_str = format_price(result["price"], result["currency"])
-            message = f"""
+            # 查詢價格（在 thread 中執行，避免阻塞事件循環）
+            self.logger.info(f"開始查詢股票價格: {symbol}")
+            result = await asyncio.to_thread(self.stock_fetcher.get_price, symbol)
+            self.logger.info(f"查詢完成: {symbol}, 成功={result['success']}")
+
+            if result["success"]:
+                price_str = format_price(result["price"], result["currency"])
+                source = result.get("source", "unknown")
+                message = f"""
 📊 {result['symbol']}
 💰 當前價格：{price_str}
+🔹 資料來源：{source}
 🕐 查詢時間：{result['timestamp'][:19]}
-            """
-            await update.message.reply_text(message.strip())
-            self.logger.info(
-                f"用戶 {update.effective_user.id} 查詢: {symbol} = {result['price']}"
-            )
-        else:
-            await update.message.reply_text(
-                f"❌ 查詢失敗：{symbol}\n錯誤：{result.get('error', '未知錯誤')}\n"
-                f"請確認股票代碼是否正確。"
-            )
+                """
+                self.logger.info(f"準備回覆用戶 {user_id}: {symbol} = {result['price']}")
+                await update.message.reply_text(message.strip())
+                self.logger.info(f"✅ 已回覆用戶 {user_id}")
+            else:
+                error_msg = result.get('error', '未知錯誤')
+                self.logger.warning(f"查詢失敗: {symbol}, 錯誤: {error_msg}")
+                await update.message.reply_text(
+                    f"❌ 查詢失敗：{symbol}\n錯誤：{error_msg}\n"
+                    f"請確認股票代碼是否正確。"
+                )
+
+        except Exception as e:
+            self.logger.error(f"❌ price_command 執行失敗: {e}", exc_info=True)
+            try:
+                await update.message.reply_text(f"❌ 系統錯誤：{str(e)}")
+            except:
+                pass
 
     async def add_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """處理 /add 命令"""
-        if not context.args or len(context.args) != 3:
-            await update.message.reply_text(
-                "❌ 用法錯誤！\n"
-                "正確格式：/add <股票代碼> <above/below> <目標價格>\n"
-                "範例：/add 2330.TW above 600"
-            )
-            return
-
-        symbol = context.args[0]
-        condition = context.args[1].lower()
         try:
-            target_price = float(context.args[2])
-        except ValueError:
-            await update.message.reply_text("❌ 目標價格必須是數字！")
-            return
+            user_id = update.effective_user.id
+            self.logger.info(f"用戶 {user_id} 執行 /add 命令")
 
-        if condition not in ["above", "below"]:
-            await update.message.reply_text("❌ 條件必須是 'above' 或 'below'！")
-            return
+            if not context.args or len(context.args) != 3:
+                await update.message.reply_text(
+                    "❌ 用法錯誤！\n"
+                    "正確格式：/add <股票代碼> <above/below> <目標價格>\n"
+                    "範例：/add 2330.TW above 600"
+                )
+                return
 
-        # 先驗證股票代碼（可選，避免新增無效代碼）
-        symbol_normalized = self.stock_fetcher.normalize_symbol(symbol)
-        await update.message.reply_text(f"⏳ 驗證股票代碼：{symbol_normalized}...")
+            symbol = context.args[0]
+            condition = context.args[1].lower()
 
-        price_check = self.stock_fetcher.get_price(symbol_normalized)
-        if not price_check["success"]:
-            await update.message.reply_text(
-                f"❌ 無法查詢到此股票：{symbol_normalized}\n"
-                f"請確認代碼是否正確。"
-            )
-            return
+            try:
+                target_price = float(context.args[2])
+            except ValueError:
+                await update.message.reply_text("❌ 目標價格必須是數字！")
+                return
 
-        # 新增監控
-        try:
+            if condition not in ["above", "below"]:
+                await update.message.reply_text("❌ 條件必須是 'above' 或 'below'！")
+                return
+
+            # 先驗證股票代碼
+            symbol_normalized = self.stock_fetcher.normalize_symbol(symbol)
+            self.logger.info(f"驗證股票代碼: {symbol_normalized}")
+
+            await self.safe_reply(update, f"⏳ 驗證股票代碼：{symbol_normalized}...")
+
+            self.logger.info(f"開始查詢股票價格: {symbol_normalized}")
+            price_check = await asyncio.to_thread(self.stock_fetcher.get_price, symbol_normalized)
+            self.logger.info(f"價格查詢完成: {symbol_normalized}, 成功={price_check['success']}")
+
+            if not price_check["success"]:
+                await update.message.reply_text(
+                    f"❌ 無法查詢到此股票：{symbol_normalized}\n"
+                    f"請確認代碼是否正確。"
+                )
+                return
+
+            # 新增監控
+            self.logger.info(f"新增監控: {symbol_normalized} {condition} {target_price}")
             alert = self.alert_manager.add_alert(
-                user_id=update.effective_user.id,
+                user_id=user_id,
                 symbol=symbol_normalized,
                 target_price=target_price,
                 condition=condition
@@ -181,6 +238,7 @@ class TelegramBotHandler:
 
             condition_text = "高於" if condition == "above" else "低於"
             price_str = format_price(target_price, price_check["currency"])
+            current_price_str = format_price(price_check['price'], price_check['currency'])
 
             message = f"""
 ✅ 監控已新增！
@@ -188,21 +246,22 @@ class TelegramBotHandler:
 📊 股票：{alert['symbol']}
 🎯 條件：價格 {condition_text} {price_str}
 🆔 監控ID：{alert['id'][:8]}...
-💰 當前價格：{format_price(price_check['price'], price_check['currency'])}
+💰 當前價格：{current_price_str}
 
 系統會每 5 分鐘檢查一次，達標時會通知你。
 使用 /list 查看所有監控。
             """
-            await update.message.reply_text(message.strip())
 
-            self.logger.info(
-                f"用戶 {update.effective_user.id} 新增監控: "
-                f"{symbol_normalized} {condition} {target_price}"
-            )
+            self.logger.info(f"準備回覆用戶 {user_id}")
+            await self.safe_reply(update, message.strip())
+            self.logger.info(f"✅ 監控新增完成，已通知用戶 {user_id}")
 
         except Exception as e:
-            await update.message.reply_text(f"❌ 新增失敗：{str(e)}")
-            self.logger.error(f"新增監控失敗: {e}")
+            self.logger.error(f"❌ add_command 執行失敗: {e}", exc_info=True)
+            try:
+                await update.message.reply_text(f"❌ 新增失敗：{str(e)}")
+            except:
+                pass
 
     async def list_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """處理 /list 命令"""
@@ -354,6 +413,13 @@ class TelegramBotHandler:
             alert_info: 包含 alert、current_price、currency 的字典
         """
         try:
+            # 檢查 Bot 是否已初始化
+            if not self.application or not self.application.bot:
+                self.logger.warning(
+                    f"Telegram Bot 尚未初始化，無法發送通知給用戶 {user_id}"
+                )
+                return
+
             alert = alert_info["alert"]
             current_price = alert_info["current_price"]
             currency = alert_info["currency"]
@@ -372,17 +438,76 @@ class TelegramBotHandler:
 條件已達成，請注意！
             """
 
+            # 創建移除按鈕
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        "🗑️ 移除此警報",
+                        callback_data=f"remove_alert:{alert['id']}"
+                    )
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            self.logger.info(
+                f"正在發送通知給用戶 {user_id}: {alert['symbol']} {current_price}"
+            )
+
             await self.application.bot.send_message(
                 chat_id=user_id,
-                text=message.strip()
+                text=message.strip(),
+                reply_markup=reply_markup
             )
 
             self.logger.info(
-                f"已發送通知給用戶 {user_id}: {alert['symbol']} {current_price}"
+                f"✅ 通知發送成功 (用戶 {user_id})"
             )
 
         except Exception as e:
-            self.logger.error(f"發送通知失敗 (用戶 {user_id}): {e}")
+            self.logger.error(f"❌ 發送通知失敗 (用戶 {user_id}): {e}", exc_info=True)
+
+    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """處理按鈕點擊回調"""
+        query = update.callback_query
+        await query.answer()  # 回應按鈕點擊
+
+        try:
+            user_id = query.from_user.id
+            callback_data = query.data
+
+            self.logger.info(f"收到按鈕點擊: {callback_data} (用戶 {user_id})")
+
+            # 解析 callback_data
+            if callback_data.startswith("remove_alert:"):
+                alert_id = callback_data.split(":", 1)[1]
+
+                # 移除警報
+                self.logger.info(f"嘗試移除警報: {alert_id}")
+                success = self.alert_manager.remove_alert(user_id, alert_id)
+
+                if success:
+                    # 更新訊息，移除按鈕
+                    await query.edit_message_text(
+                        text=f"{query.message.text}\n\n✅ 警報已移除",
+                        reply_markup=None
+                    )
+                    self.logger.info(f"✅ 警報已移除: {alert_id} (用戶 {user_id})")
+                else:
+                    await query.edit_message_text(
+                        text=f"{query.message.text}\n\n❌ 移除失敗（警報不存在或無權限）",
+                        reply_markup=None
+                    )
+                    self.logger.warning(f"移除警報失敗: {alert_id} (用戶 {user_id})")
+
+        except Exception as e:
+            self.logger.error(f"❌ 按鈕回調處理失敗: {e}", exc_info=True)
+            try:
+                await query.edit_message_text(
+                    text=f"{query.message.text}\n\n❌ 操作失敗：{str(e)}",
+                    reply_markup=None
+                )
+            except:
+                pass
 
     def run(self):
         """啟動 Bot（阻塞運行）"""
@@ -400,6 +525,9 @@ class TelegramBotHandler:
         self.application.add_handler(CommandHandler("remove", self.remove_command))
         self.application.add_handler(CommandHandler("clear", self.clear_command))
         self.application.add_handler(CommandHandler("clearstock", self.clearstock_command))
+
+        # 註冊按鈕回調處理器
+        self.application.add_handler(CallbackQueryHandler(self.button_callback))
 
         # 註冊錯誤處理器
         self.application.add_error_handler(self.error_handler)

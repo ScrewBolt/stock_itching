@@ -1,5 +1,6 @@
 """股票價格查詢模組"""
 import logging
+import os
 import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
@@ -11,21 +12,22 @@ import requests
 class StockFetcher:
     """股票價格查詢類別"""
 
-    def __init__(self, retry_attempts: int = 3, retry_delay: int = 5):
+    def __init__(self, retry_attempts: int = 1, retry_delay: int = 2):
         """
         初始化股票查詢器
 
         Args:
-            retry_attempts: 最大重試次數
+            retry_attempts: 每個 API 的最大嘗試次數（預設 1，快速故障轉移）
             retry_delay: 重試間隔秒數
         """
         self.retry_attempts = retry_attempts
         self.retry_delay = retry_delay
         self.logger = logging.getLogger(__name__)
         self._last_request_time = None
-        self._min_request_interval = 2.0  # 最小請求間隔 2 秒
+        self._min_request_interval = 1.0  # 最小請求間隔 1 秒（減少等待）
         self._rate_limit_wait = 60  # 遇到 429 錯誤時等待 60 秒
         self._use_finmind_backup = True  # 啟用 FinMind 備援
+        self._alpha_vantage_key = os.getenv("ALPHA_VANTAGE_API_KEY", "demo")  # Alpha Vantage API Key
 
     def normalize_symbol(self, symbol: str) -> str:
         """
@@ -156,60 +158,135 @@ class StockFetcher:
                 "source": "finmind"
             }
 
+    def _get_price_from_alphavantage(self, symbol: str) -> Dict[str, Any]:
+        """
+        從 Alpha Vantage API 查詢股票價格（第三層備援）
+
+        Args:
+            symbol: 股票代碼（支援美股和台股）
+
+        Returns:
+            價格資訊字典
+        """
+        try:
+            # Alpha Vantage 不支援 .TW 後綴，台股需要特殊處理
+            av_symbol = symbol
+            is_taiwan = False
+
+            if ".TW" in symbol.upper():
+                # 台股：移除 .TW 並加上 .TPE（台北交易所代碼）
+                stock_id = symbol.replace(".TW", "").replace(".tw", "")
+                av_symbol = f"{stock_id}.TPE"
+                is_taiwan = True
+                self.logger.info(f"使用 Alpha Vantage 查詢台股: {av_symbol}")
+            else:
+                self.logger.info(f"使用 Alpha Vantage 查詢: {av_symbol}")
+
+            # 呼叫 Alpha Vantage API
+            url = "https://www.alphavantage.co/query"
+            params = {
+                "function": "GLOBAL_QUOTE",
+                "symbol": av_symbol,
+                "apikey": self._alpha_vantage_key
+            }
+
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+
+            data = response.json()
+
+            # 檢查是否有 "Global Quote" 資料
+            if "Global Quote" in data and data["Global Quote"]:
+                quote = data["Global Quote"]
+                price_str = quote.get("05. price")
+
+                if price_str:
+                    price = float(price_str)
+                    currency = "TWD" if is_taiwan else "USD"
+
+                    return {
+                        "symbol": symbol,
+                        "price": price,
+                        "currency": currency,
+                        "timestamp": datetime.now().isoformat(),
+                        "success": True,
+                        "source": "alphavantage"
+                    }
+
+            # 檢查是否有 API 限制訊息
+            if "Note" in data:
+                self.logger.warning(f"Alpha Vantage API 限制: {data['Note']}")
+                return {
+                    "symbol": symbol,
+                    "price": None,
+                    "currency": None,
+                    "timestamp": datetime.now().isoformat(),
+                    "success": False,
+                    "error": "Alpha Vantage API 達到請求限制",
+                    "source": "alphavantage"
+                }
+
+            return {
+                "symbol": symbol,
+                "price": None,
+                "currency": None,
+                "timestamp": datetime.now().isoformat(),
+                "success": False,
+                "error": "Alpha Vantage API 無資料",
+                "source": "alphavantage"
+            }
+
+        except Exception as e:
+            self.logger.error(f"Alpha Vantage 查詢失敗 ({symbol}): {e}")
+            return {
+                "symbol": symbol,
+                "price": None,
+                "currency": None,
+                "timestamp": datetime.now().isoformat(),
+                "success": False,
+                "error": f"Alpha Vantage API 錯誤: {str(e)}",
+                "source": "alphavantage"
+            }
+
     def get_price(self, symbol: str) -> Dict[str, Any]:
         """
-        查詢股票當前價格（帶重試機制和 Rate Limiting）
+        查詢股票當前價格（快速故障轉移機制）
+
+        策略：
+        1. 嘗試 yfinance（1次）
+        2. 如果失敗：
+           - 台股 → FinMind → Alpha Vantage
+           - 美股 → Alpha Vantage
 
         Args:
             symbol: 股票代碼
 
         Returns:
-            包含價格資訊的字典：
-            {
-                'symbol': str,
-                'price': float,
-                'currency': str,
-                'timestamp': str,
-                'success': bool,
-                'error': str (如果失敗)
-            }
+            包含價格資訊的字典
         """
         # 標準化代碼
         symbol = self.normalize_symbol(symbol)
+        is_taiwan_stock = ".TW" in symbol.upper()
 
-        # 重試邏輯
-        for attempt in range(1, self.retry_attempts + 1):
-            try:
-                # Rate Limiting：確保請求間隔
-                self._wait_for_rate_limit()
+        # 1. 嘗試 yfinance（主要 API）
+        try:
+            self._wait_for_rate_limit()
+            self.logger.info(f"[yfinance] 查詢: {symbol}")
 
-                self.logger.info(f"查詢股票價格: {symbol} (嘗試 {attempt}/{self.retry_attempts})")
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
 
-                # 使用 yfinance 查詢
-                ticker = yf.Ticker(symbol)
-                info = ticker.info
+            # 嘗試多種價格欄位
+            price = None
+            for field in ["regularMarketPrice", "currentPrice", "previousClose", "open"]:
+                if field in info and info[field] is not None:
+                    price = float(info[field])
+                    break
 
-                # 嘗試多種價格欄位（不同市場欄位名稱可能不同）
-                price = None
-                price_fields = [
-                    "regularMarketPrice",
-                    "currentPrice",
-                    "previousClose",
-                    "open"
-                ]
-
-                for field in price_fields:
-                    if field in info and info[field] is not None:
-                        price = float(info[field])
-                        break
-
-                if price is None:
-                    raise ValueError(f"無法取得 {symbol} 的價格資訊")
-
-                # 取得貨幣
+            if price is not None:
                 currency = info.get("currency", "USD")
-
-                result = {
+                self.logger.info(f"✅ [yfinance] 成功: {symbol} = {price} {currency}")
+                return {
                     "symbol": symbol,
                     "price": price,
                     "currency": currency,
@@ -218,42 +295,49 @@ class StockFetcher:
                     "source": "yfinance"
                 }
 
-                self.logger.info(f"成功查詢 (yfinance): {symbol} = {price} {currency}")
-                return result
+        except Exception as e:
+            self.logger.warning(f"❌ [yfinance] 失敗: {symbol} - {e}")
 
-            except Exception as e:
-                error_msg = str(e)
-                self.logger.error(f"查詢失敗 ({symbol}, 嘗試 {attempt}/{self.retry_attempts}): {e}")
-
-                # 檢查是否是 429 錯誤（Rate Limit）
-                if "429" in error_msg or "Too Many Requests" in error_msg:
-                    wait_time = self._rate_limit_wait if attempt == 1 else self._rate_limit_wait * attempt
-                    self.logger.warning(
-                        f"遇到 API Rate Limit (429)，等待 {wait_time} 秒後重試..."
-                    )
-                    time.sleep(wait_time)
-                # 如果還有重試機會，等待後重試
-                elif attempt < self.retry_attempts:
-                    self.logger.info(f"等待 {self.retry_delay} 秒後重試...")
-                    time.sleep(self.retry_delay)
-
-        # 所有重試都失敗，嘗試使用 FinMind 備援（僅限台股）
-        if self._use_finmind_backup and (".TW" in symbol.upper() or symbol.isdigit()):
-            self.logger.warning(f"yfinance 查詢失敗，嘗試使用 FinMind 備援查詢 {symbol}")
+        # 2. yfinance 失敗，快速切換到備援
+        if is_taiwan_stock and self._use_finmind_backup:
+            # 台股：嘗試 FinMind
+            self.logger.info(f"⚡ 快速切換到 FinMind: {symbol}")
             finmind_result = self._get_price_from_finmind(symbol)
 
             if finmind_result.get("success"):
-                self.logger.info(f"FinMind 備援查詢成功: {symbol} = {finmind_result['price']}")
+                self.logger.info(f"✅ [FinMind] 成功: {symbol} = {finmind_result['price']}")
                 return finmind_result
+            else:
+                self.logger.warning(f"❌ [FinMind] 失敗: {symbol}")
 
-        # 所有方法都失敗
+        # 3. 嘗試 Alpha Vantage（台股和美股都支援）
+        if self._alpha_vantage_key and self._alpha_vantage_key != "demo":
+            self.logger.info(f"⚡ 嘗試 Alpha Vantage: {symbol}")
+            av_result = self._get_price_from_alphavantage(symbol)
+
+            if av_result.get("success"):
+                self.logger.info(f"✅ [Alpha Vantage] 成功: {symbol} = {av_result['price']}")
+                return av_result
+            else:
+                self.logger.warning(f"❌ [Alpha Vantage] 失敗: {symbol}")
+
+        # 所有 API 都失敗
+        apis_tried = ["yfinance"]
+        if is_taiwan_stock:
+            apis_tried.append("FinMind")
+        if self._alpha_vantage_key and self._alpha_vantage_key != "demo":
+            apis_tried.append("Alpha Vantage")
+
+        error_msg = f"所有 API 都失敗: {', '.join(apis_tried)}"
+        self.logger.error(f"❌ {error_msg} ({symbol})")
+
         return {
             "symbol": symbol,
             "price": None,
             "currency": None,
             "timestamp": datetime.now().isoformat(),
             "success": False,
-            "error": "所有 API 都失敗（yfinance + FinMind）"
+            "error": error_msg
         }
 
     def get_multiple_prices(self, symbols: list) -> Dict[str, Dict]:

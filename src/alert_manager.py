@@ -23,7 +23,7 @@ class AlertManager:
         """
         self.watchlist_file = watchlist_file
         self.logger = logging.getLogger(__name__)
-        self._lock = threading.Lock()  # 添加鎖保護並發訪問
+        self._lock = threading.RLock()  # 可重入鎖，避免死鎖
         self.data = self._load_data()
 
     def _load_data(self) -> Dict:

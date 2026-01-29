@@ -72,6 +72,9 @@ class StockMonitorScheduler:
                 # 4. 發送通知（使用 asyncio 因為 telegram 是異步的）
                 for alert_info in triggered_alerts:
                     user_id = alert_info["alert"]["user_id"]
+                    symbol = alert_info["alert"]["symbol"]
+
+                    self.logger.info(f"準備發送通知: {symbol} -> 用戶 {user_id}")
 
                     # 安全地運行異步函數
                     try:
@@ -80,16 +83,19 @@ class StockMonitorScheduler:
                             loop = asyncio.get_event_loop()
                             if loop.is_running():
                                 # 如果循環正在運行，創建任務
+                                self.logger.debug("使用現有運行中的事件循環")
                                 asyncio.create_task(
                                     self.telegram_handler.send_alert(user_id, alert_info)
                                 )
                             else:
                                 # 如果循環未運行，直接運行
+                                self.logger.debug("使用現有但未運行的事件循環")
                                 loop.run_until_complete(
                                     self.telegram_handler.send_alert(user_id, alert_info)
                                 )
-                        except RuntimeError:
+                        except RuntimeError as re:
                             # 沒有事件循環，創建新的
+                            self.logger.debug(f"創建新的事件循環: {re}")
                             loop = asyncio.new_event_loop()
                             asyncio.set_event_loop(loop)
                             loop.run_until_complete(
@@ -97,7 +103,8 @@ class StockMonitorScheduler:
                             )
                     except Exception as e:
                         self.logger.error(
-                            f"發送通知失敗 (用戶 {user_id}): {e}"
+                            f"❌ 發送通知失敗 (用戶 {user_id}, {symbol}): {e}",
+                            exc_info=True
                         )
 
             self.logger.info("檢查完成")
@@ -106,15 +113,16 @@ class StockMonitorScheduler:
         except Exception as e:
             self.logger.error(f"檢查過程發生錯誤: {e}", exc_info=True)
 
-    def start(self):
-        """啟動排程器"""
+    def start(self, run_immediately: bool = False):
+        """
+        啟動排程器
+
+        Args:
+            run_immediately: 是否立即執行一次檢查（預設 False，避免 Bot 未初始化）
+        """
         self.logger.info(
             f"啟動排程器 - 每 {self.check_interval_minutes} 分鐘檢查一次"
         )
-
-        # 立即執行一次檢查
-        self.logger.info("執行初始檢查...")
-        self.check_all_stocks()
 
         # 設定定時任務
         self.scheduler.add_job(
@@ -128,6 +136,11 @@ class StockMonitorScheduler:
         # 啟動排程器
         self.scheduler.start()
         self.logger.info("排程器已啟動")
+
+        # 可選：立即執行一次檢查（僅在 Bot 完全初始化後使用）
+        if run_immediately:
+            self.logger.info("執行初始檢查...")
+            self.check_all_stocks()
 
     def stop(self):
         """停止排程器"""
