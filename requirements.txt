@@ -3,3 +3,5 @@ python-telegram-bot==20.8
 APScheduler==3.10.4
 python-dotenv==1.0.1
 pytz==2024.1
+FinMind==1.5.1
+requests==2.31.0
