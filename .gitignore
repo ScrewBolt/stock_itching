@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+config/watchlist.json
+logs/*.log
+venv/
+.DS_Store
