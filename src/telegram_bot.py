@@ -236,6 +236,25 @@ class TelegramBotHandler:
                 condition=condition
             )
 
+            # 檢查是否重複（add_alert 返回 None 表示忽略重複警報）
+            if alert is None:
+                condition_text = "高於" if condition == "above" else "低於"
+                price_str = format_price(target_price, price_check["currency"])
+                current_price_str = format_price(price_check['price'], price_check['currency'])
+
+                message = f"""
+ℹ️ 此監控已存在，未重複新增
+
+📊 股票：{symbol_normalized}
+🎯 條件：價格 {condition_text} {price_str}
+💰 當前價格：{current_price_str}
+
+使用 /list 查看所有監控。
+                """
+                self.logger.info(f"通知用戶 {user_id} 重複警報已忽略")
+                await self.safe_reply(update, message.strip())
+                return
+
             condition_text = "高於" if condition == "above" else "低於"
             price_str = format_price(target_price, price_check["currency"])
             current_price_str = format_price(price_check['price'], price_check['currency'])
@@ -265,103 +284,132 @@ class TelegramBotHandler:
 
     async def list_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """處理 /list 命令"""
-        user_id = update.effective_user.id
-        alerts = self.alert_manager.list_alerts(user_id)
+        try:
+            user_id = update.effective_user.id
+            self.logger.info(f"用戶 {user_id} 執行 /list 命令")
+            alerts = self.alert_manager.list_alerts(user_id)
 
-        if not alerts:
-            await update.message.reply_text(
-                "📋 你目前沒有任何監控。\n使用 /add 命令來新增監控。"
-            )
-            return
+            if not alerts:
+                await self.safe_reply(
+                    update,
+                    "📋 你目前沒有任何監控。\n使用 /add 命令來新增監控。"
+                )
+                return
 
-        message_parts = ["📋 你的監控清單：\n"]
+            message_parts = ["📋 你的監控清單：\n"]
 
-        for i, alert in enumerate(alerts, 1):
-            condition_text = "高於" if alert["condition"] == "above" else "低於"
-            status = "🔔 已通知" if alert["notified"] else "⏳ 監控中"
+            for i, alert in enumerate(alerts, 1):
+                condition_text = "高於" if alert["condition"] == "above" else "低於"
+                status = "🔔 已通知" if alert["notified"] else "⏳ 監控中"
+
+                message_parts.append(
+                    f"{i}. {alert['symbol']}\n"
+                    f"   條件：{condition_text} {alert['target_price']}\n"
+                    f"   狀態：{status}\n"
+                    f"   ID：{alert['id'][:8]}...\n"
+                )
 
             message_parts.append(
-                f"{i}. {alert['symbol']}\n"
-                f"   條件：{condition_text} {alert['target_price']}\n"
-                f"   狀態：{status}\n"
-                f"   ID：{alert['id'][:8]}...\n"
+                f"\n共 {len(alerts)} 個監控\n使用 /remove <ID> 可移除監控"
             )
 
-        message_parts.append(
-            f"\n共 {len(alerts)} 個監控\n使用 /remove <ID> 可移除監控"
-        )
+            await self.safe_reply(update, "\n".join(message_parts))
+            self.logger.info(f"✅ 已回覆用戶 {user_id} 監控清單")
 
-        await update.message.reply_text("\n".join(message_parts))
-        self.logger.info(f"用戶 {user_id} 查看監控清單")
+        except Exception as e:
+            self.logger.error(f"❌ list_command 執行失敗: {e}", exc_info=True)
+            try:
+                await update.message.reply_text(f"❌ 查詢失敗：{str(e)}")
+            except:
+                pass
 
     async def remove_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """處理 /remove 命令"""
-        if not context.args or len(context.args) != 1:
-            await update.message.reply_text(
-                "❌ 用法錯誤！\n"
-                "正確格式：/remove <監控ID>\n"
-                "先使用 /list 查看監控 ID"
-            )
-            return
+        try:
+            user_id = update.effective_user.id
+            self.logger.info(f"用戶 {user_id} 執行 /remove 命令")
 
-        alert_id_prefix = context.args[0]
-        user_id = update.effective_user.id
+            if not context.args or len(context.args) != 1:
+                await self.safe_reply(
+                    update,
+                    "❌ 用法錯誤！\n"
+                    "正確格式：/remove <監控ID>\n"
+                    "先使用 /list 查看監控 ID"
+                )
+                return
 
-        # 尋找匹配的監控 ID
-        alerts = self.alert_manager.list_alerts(user_id)
-        matched_alert = None
+            alert_id_prefix = context.args[0]
 
-        for alert in alerts:
-            if alert["id"].startswith(alert_id_prefix):
-                matched_alert = alert
-                break
+            # 尋找匹配的監控 ID
+            alerts = self.alert_manager.list_alerts(user_id)
+            matched_alert = None
 
-        if not matched_alert:
-            await update.message.reply_text(
-                f"❌ 找不到 ID 為 {alert_id_prefix} 的監控。\n"
-                f"使用 /list 查看你的監控清單。"
-            )
-            return
+            for alert in alerts:
+                if alert["id"].startswith(alert_id_prefix):
+                    matched_alert = alert
+                    break
 
-        # 移除監控
-        success = self.alert_manager.remove_alert(user_id, matched_alert["id"])
+            if not matched_alert:
+                await self.safe_reply(
+                    update,
+                    f"❌ 找不到 ID 為 {alert_id_prefix} 的監控。\n"
+                    f"使用 /list 查看你的監控清單。"
+                )
+                return
 
-        if success:
-            await update.message.reply_text(
-                f"✅ 已移除監控：{matched_alert['symbol']}"
-            )
-            self.logger.info(
-                f"用戶 {user_id} 移除監控: {matched_alert['id']}"
-            )
-        else:
-            await update.message.reply_text("❌ 移除失敗，請稍後再試。")
+            # 移除監控
+            success = self.alert_manager.remove_alert(user_id, matched_alert["id"])
+
+            if success:
+                await self.safe_reply(
+                    update,
+                    f"✅ 已移除監控：{matched_alert['symbol']}"
+                )
+                self.logger.info(
+                    f"✅ 用戶 {user_id} 移除監控: {matched_alert['id']}"
+                )
+            else:
+                await self.safe_reply(update, "❌ 移除失敗，請稍後再試。")
+
+        except Exception as e:
+            self.logger.error(f"❌ remove_command 執行失敗: {e}", exc_info=True)
+            try:
+                await update.message.reply_text(f"❌ 移除失敗：{str(e)}")
+            except:
+                pass
 
     async def clear_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """處理 /clear 命令 - 清空所有監控"""
-        user_id = update.effective_user.id
+        try:
+            user_id = update.effective_user.id
+            self.logger.info(f"用戶 {user_id} 執行 /clear 命令")
 
-        # 先檢查是否有監控
-        alerts = self.alert_manager.list_alerts(user_id)
+            # 先檢查是否有監控
+            alerts = self.alert_manager.list_alerts(user_id)
 
-        if not alerts:
-            await update.message.reply_text(
-                "📋 你目前沒有任何監控。"
-            )
-            return
+            if not alerts:
+                await self.safe_reply(update, "📋 你目前沒有任何監控。")
+                return
 
-        # 執行清空
-        cleared_count = self.alert_manager.clear_all_alerts(user_id)
+            # 執行清空
+            cleared_count = self.alert_manager.clear_all_alerts(user_id)
 
-        if cleared_count > 0:
-            await update.message.reply_text(
-                f"✅ 已清空 {cleared_count} 個監控！\n"
-                f"使用 /add 可以重新新增監控。"
-            )
-            self.logger.info(f"用戶 {user_id} 清空了 {cleared_count} 個監控")
-        else:
-            await update.message.reply_text(
-                "📋 沒有監控需要清空。"
-            )
+            if cleared_count > 0:
+                await self.safe_reply(
+                    update,
+                    f"✅ 已清空 {cleared_count} 個監控！\n"
+                    f"使用 /add 可以重新新增監控。"
+                )
+                self.logger.info(f"用戶 {user_id} 清空了 {cleared_count} 個監控")
+            else:
+                await self.safe_reply(update, "📋 沒有監控需要清空。")
+
+        except Exception as e:
+            self.logger.error(f"❌ clear_command 執行失敗: {e}", exc_info=True)
+            try:
+                await update.message.reply_text(f"❌ 清空失敗：{str(e)}")
+            except:
+                pass
 
     async def clearstock_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """處理 /clearstock 命令 - 清空指定股票的所有監控"""

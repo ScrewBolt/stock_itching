@@ -81,38 +81,46 @@ class StockFetcher:
 
     def _get_price_from_finmind(self, symbol: str) -> Dict[str, Any]:
         """
-        從 FinMind API 查詢台股價格（備援方案）
+        從 FinMind API 查詢股票價格（支援台股和美股）
 
         Args:
-            symbol: 股票代碼（必須是台股，例如 2330）
+            symbol: 股票代碼（台股如 2330.TW，美股如 AAPL）
 
         Returns:
             價格資訊字典
         """
         try:
-            # FinMind 只支援台股，移除 .TW 後綴
-            stock_id = symbol.replace(".TW", "").replace(".tw", "")
+            # 判斷是台股還是美股
+            is_taiwan_stock = ".TW" in symbol.upper() or (
+                symbol.replace(".TW", "").replace(".tw", "").isdigit() and
+                len(symbol.replace(".TW", "").replace(".tw", "")) == 4
+            )
 
-            # 檢查是否為台股代碼（4 位數字）
-            if not (stock_id.isdigit() and len(stock_id) == 4):
-                return {
-                    "symbol": symbol,
-                    "price": None,
-                    "currency": None,
-                    "timestamp": datetime.now().isoformat(),
-                    "success": False,
-                    "error": "FinMind 只支援台股代碼",
-                    "source": "finmind"
-                }
+            if is_taiwan_stock:
+                # 台股：移除 .TW 後綴
+                stock_id = symbol.replace(".TW", "").replace(".tw", "")
+                dataset = "TaiwanStockPrice"
+                currency = "TWD"
+                self.logger.info(f"使用 FinMind 查詢台股: {stock_id}")
+            else:
+                # 美股：直接使用代碼
+                stock_id = symbol.upper()
+                dataset = "USStockPrice"
+                currency = "USD"
+                self.logger.info(f"使用 FinMind 查詢美股: {stock_id}")
 
-            self.logger.info(f"使用 FinMind 備援查詢: {stock_id}")
-
-            # 呼叫 FinMind API（使用台灣即時股價 API）
+            # 呼叫 FinMind API
             url = "https://api.finmindtrade.com/api/v4/data"
+
+            # 查詢最近 3 天的資料（確保有資料）
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=3)
+
             params = {
-                "dataset": "TaiwanStockPrice",
+                "dataset": dataset,
                 "data_id": stock_id,
-                "start_date": datetime.now().strftime("%Y-%m-%d")
+                "start_date": start_date.strftime("%Y-%m-%d"),
+                "end_date": end_date.strftime("%Y-%m-%d")
             }
 
             response = requests.get(url, params=params, timeout=10)
@@ -124,13 +132,17 @@ class StockFetcher:
             if data.get("status") == 200 and data.get("data") and len(data["data"]) > 0:
                 # 取得最新一筆資料
                 latest = data["data"][-1]
-                price = float(latest.get("close", 0))
+
+                # FinMind 回傳的欄位名稱（大寫 C）
+                price = float(latest.get("Close", latest.get("close", 0)))
 
                 if price > 0:
+                    # 保持原始 symbol 格式
+                    return_symbol = f"{stock_id}.TW" if is_taiwan_stock else stock_id
                     return {
-                        "symbol": f"{stock_id}.TW",
+                        "symbol": return_symbol,
                         "price": price,
-                        "currency": "TWD",
+                        "currency": currency,
                         "timestamp": datetime.now().isoformat(),
                         "success": True,
                         "source": "finmind"
@@ -254,9 +266,8 @@ class StockFetcher:
 
         策略：
         1. 嘗試 yfinance（1次）
-        2. 如果失敗：
-           - 台股 → FinMind → Alpha Vantage
-           - 美股 → Alpha Vantage
+        2. 如果失敗 → FinMind（支援台股和美股）
+        3. 如果仍失敗 → Alpha Vantage（需有效 API Key）
 
         Args:
             symbol: 股票代碼
@@ -298,9 +309,8 @@ class StockFetcher:
         except Exception as e:
             self.logger.warning(f"❌ [yfinance] 失敗: {symbol} - {e}")
 
-        # 2. yfinance 失敗，快速切換到備援
-        if is_taiwan_stock and self._use_finmind_backup:
-            # 台股：嘗試 FinMind
+        # 2. yfinance 失敗，快速切換到 FinMind（支援台股和美股）
+        if self._use_finmind_backup:
             self.logger.info(f"⚡ 快速切換到 FinMind: {symbol}")
             finmind_result = self._get_price_from_finmind(symbol)
 
@@ -323,7 +333,7 @@ class StockFetcher:
 
         # 所有 API 都失敗
         apis_tried = ["yfinance"]
-        if is_taiwan_stock:
+        if self._use_finmind_backup:
             apis_tried.append("FinMind")
         if self._alpha_vantage_key and self._alpha_vantage_key != "demo":
             apis_tried.append("Alpha Vantage")

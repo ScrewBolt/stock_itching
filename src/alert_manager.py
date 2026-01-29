@@ -51,9 +51,9 @@ class AlertManager:
         symbol: str,
         target_price: float,
         condition: str
-    ) -> Dict[str, Any]:
+    ) -> Optional[Dict[str, Any]]:
         """
-        新增監控
+        新增監控（自動檢查重複）
 
         Args:
             user_id: Telegram 用戶 ID
@@ -62,17 +62,35 @@ class AlertManager:
             condition: 條件 ('above' 或 'below')
 
         Returns:
-            新增的監控資訊
+            新增的監控資訊，如果已存在相同監控則返回 None
         """
         if condition not in ["above", "below"]:
             raise ValueError(f"無效的條件: {condition}，必須是 'above' 或 'below'")
 
         with self._lock:
+            symbol_upper = symbol.upper()
+            target_price_float = float(target_price)
+
+            # 檢查是否已存在相同的監控
+            for existing_alert in self.data["alerts"]:
+                if (existing_alert["user_id"] == user_id and
+                    existing_alert["symbol"] == symbol_upper and
+                    existing_alert["condition"] == condition and
+                    abs(existing_alert["target_price"] - target_price_float) < 0.01 and
+                    existing_alert["enabled"]):
+
+                    self.logger.warning(
+                        f"⚠️  忽略重複監控: 用戶 {user_id} | {symbol_upper} | "
+                        f"{condition} {target_price_float} (已存在 ID: {existing_alert['id']})"
+                    )
+                    return None
+
+            # 建立新監控
             alert = {
                 "id": generate_alert_id(),
                 "user_id": user_id,
-                "symbol": symbol.upper(),
-                "target_price": float(target_price),
+                "symbol": symbol_upper,
+                "target_price": target_price_float,
                 "condition": condition,
                 "created_at": datetime.now().isoformat(),
                 "notified": False,
@@ -84,8 +102,8 @@ class AlertManager:
             self.save()
 
             self.logger.info(
-                f"新增監控: 用戶 {user_id} | {symbol} | "
-                f"{condition} {target_price} | ID: {alert['id']}"
+                f"新增監控: 用戶 {user_id} | {symbol_upper} | "
+                f"{condition} {target_price_float} | ID: {alert['id']}"
             )
 
             return alert
